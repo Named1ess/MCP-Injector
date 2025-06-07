@@ -1,3 +1,3 @@
-将MCP_Tool.cpp编译为MCP_Tool.dll
+将MCP_Tool.cpp编译为MCP_Tool.dll \
 将Injector.cpp编译为Injector.exe
 MCP_Tool.dll和Injector.exe放在同一路径下
