@@ -1,3 +1,5 @@
 将MCP_Tool.cpp编译为MCP_Tool.dll
 将Injector.cpp编译为Injector.exe
 放在同一路径下即可注入
+fastMCP启动main.py
+用sse连接8000端口即可
