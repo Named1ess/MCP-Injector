@@ -1,419 +1,184 @@
-#include <Windows.h>
-#include <process.h>    // For _beginthreadex or equivalent (though CreateThread is used here)
-#include <iostream>     // For basic logging (to debug file)
-#include <fstream>      // File logging
-#include <string>       // String manipulation
-#include <mutex>        // Thread-safe logging
-#include <vector>       // Just in case
-#include <ctime>        // Timestamp for logs
-#include <iomanip>      // For formatting time in logs
-#include <KnownFolders.h> // For SHGetKnownFolderPath
-#include <ShlObj.h>     // For SHGetFolderPathA (deprecated but used in ref)
-#include <atlstr.h>     // For CString (if needed, not strictly necessary here)
+#include <windows.h>
+#include <string>
+#include <thread>
+#include <iostream>
 
-// Disable specific warnings that might arise from Windows.h or common patterns in DLLs
-#pragma warning(disable: 4996) // Disable deprecation warnings for functions like _ftime, SHGetFolderPathA
+// Global variable to store the main window handle of the target process (e.g., Calculator).
+HWND g_hTargetWnd = NULL;
 
-// --- Global Variables and Handles ---
-HMODULE g_hModule = NULL; // Handle to the DLL itself
-HANDLE g_hMainLogicThread = NULL; // Handle to the main worker thread
-HANDLE g_hExitEvent = NULL; // Event to signal worker thread to exit
+// Global flag to control the named pipe server thread's execution.
+volatile bool g_bRunServer = true;
 
-// --- Logging System ---
-std::ofstream g_logFile;
-std::mutex g_logMutex;
+// Handle for the server thread.
+HANDLE g_hServerThread = NULL;
 
-// Logging levels
-enum LogLevel {
-    LOG_DEBUG,
-    LOG_INFO,
-    LOG_WARN,
-    LOG_ERROR
-};
+// Callback function for EnumWindows. It's called for each top-level window.
+// Its purpose is to find the main window of the process the DLL is injected into.
+BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
+    DWORD dwProcId;
+    GetWindowThreadProcessId(hwnd, &dwProcId);
 
-// Function to get current timestamp string
-std::string GetTimestamp() {
-    std::time_t now = std::time(nullptr);
-    std::tm tm_info;
-    localtime_s(&tm_info, &now); // Use thread-safe version
-    char buffer[20];
-    std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &tm_info);
-    return buffer;
+    // Compare the window's process ID with our own process ID.
+    if (dwProcId == GetCurrentProcessId()) {
+        // To ensure we get the main window, we check if it's visible and has no owner.
+        // GetWindow(hwnd, GW_OWNER) == NULL identifies top-level windows without owners,
+        // which are typically main application windows.
+        if (IsWindowVisible(hwnd) && GetWindow(hwnd, GW_OWNER) == NULL) {
+            g_hTargetWnd = hwnd;
+            // Stop enumerating windows once we've found our target.
+            return FALSE;
+        }
+    }
+    // Continue enumeration if we haven't found the window yet.
+    return TRUE;
 }
 
-// Function to log a message
-void Log(LogLevel level, const char* format, ...) {
-    std::lock_guard<std::mutex> lock(g_logMutex); // Ensure thread safety
-
-    if (!g_logFile.is_open()) {
-        // Attempt to open log file if not already open.
-        char appdata_path[MAX_PATH];
-        // Using SHGetFolderPathA as in reference, though SHGetKnownFolderPath is modern
-        if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, appdata_path))) {
-            std::string logDir = std::string(appdata_path) + "\\MCPToolDLL";
-            CreateDirectoryA(logDir.c_str(), NULL); // Create directory if it doesn't exist
-            std::string logFilePath = logDir + "\\mcp_tool.log";
-            g_logFile.open(logFilePath, std::ios::app); // Open in append mode
-        }
-    }
-
-    if (g_logFile.is_open()) {
-        const char* level_str[] = { "DEBUG", "INFO", "WARN", "ERROR" };
-
-        g_logFile << "[" << GetTimestamp() << "] ";
-        if (level >= 0 && level < sizeof(level_str) / sizeof(level_str[0])) {
-            g_logFile << "[" << level_str[level] << "] ";
-        }
-
-        // Format the message
-        va_list args;
-        va_start(args, format);
-        // Determine required buffer size
-        int size = vsnprintf(nullptr, 0, format, args);
-        va_end(args);
-
-        if (size >= 0) { // vsnprintf returns size required, or negative on error
-            std::vector<char> buffer(size + 1);
-            va_start(args, format);
-            vsnprintf(buffer.data(), buffer.size(), format, args);
-            va_end(args);
-            g_logFile << buffer.data();
-        }
-        else {
-            // vsnprintf returned error
-            g_logFile << "Error formatting log message.";
-        }
-
-        g_logFile << std::endl;
-        g_logFile.flush(); // Ensure message is written immediately
-    }
-    // Optional: Also output to debugger console if attached
-    // char debug_output[1024]; // Adjust size as needed
-    // sprintf_s(debug_output, "[MCP_TOOL] "); // Add prefix
-    // OutputDebugStringA(debug_output);
-    // // Need to format and append the actual message similarly to file logging
+// Finds the main window of the current process by enumerating all top-level windows.
+void FindMainWindow() {
+    // Reset the handle before searching.
+    g_hTargetWnd = NULL;
+    // EnumWindows iterates through all top-level windows and calls EnumWindowsProc for each.
+    EnumWindows(EnumWindowsProc, 0);
 }
 
-// Helper function to log Windows API errors
-void LogWinError(const char* msg) {
-    DWORD err = GetLastError();
-    LPVOID lpMsgBuf = nullptr; // Initialize to nullptr
-    FormatMessageA( // Use A version for char*
-        FORMAT_MESSAGE_ALLOCATE_BUFFER |
-        FORMAT_MESSAGE_FROM_SYSTEM |
-        FORMAT_MESSAGE_IGNORE_INSERTS,
-        NULL,
-        err,
-        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-        (LPSTR)&lpMsgBuf, // Cast to LPSTR for FormatMessageA
-        0, NULL);
-
-    if (lpMsgBuf != nullptr) {
-        Log(LOG_ERROR, "%s failed with error %lu: %s", msg, err, (char*)lpMsgBuf);
-        LocalFree(lpMsgBuf);
+// Sends a string of text to the target window handle using PostMessageW.
+// This is more reliable than simulating global keyboard input with SendInput because:
+// 1. It doesn't require the target window to have keyboard focus.
+// 2. It sends messages directly to the window's message queue, avoiding race conditions.
+void SendTextToWindow(const std::string& text) {
+    // If the window handle is not yet found, try to find it.
+    // This check ensures we search for the window if the DLL was injected
+    // before the main window was fully created, or if the handle became invalid.
+    if (g_hTargetWnd == NULL) {
+        FindMainWindow();
     }
-    else {
-        Log(LOG_ERROR, "%s failed with error %lu: FormatMessage failed.", msg, err);
+
+    // If we still can't find the window after trying, we cannot proceed with sending messages.
+    if (g_hTargetWnd == NULL) {
+        // Optional: Log an error or return a status indicating failure.
+        // For this example, we just return silently.
+        return;
+    }
+
+    // Iterate through each character in the string.
+    for (char c : text) {
+        // PostMessageW posts a message to the window's message queue and returns immediately.
+        // It's non-blocking. We use WM_CHAR for character input.
+        // WM_CHAR message contains the character code in WPARAM.
+        PostMessageW(g_hTargetWnd, WM_CHAR, (WPARAM)c, 0);
+        // A small delay helps the target application process messages sequentially.
+        // Adjusting this delay might be necessary depending on the target application's
+        // responsiveness. Too short might drop messages, too long makes it slow.
+        Sleep(25);
     }
 }
 
-// --- Forward Declarations ---
-// Main logic function executed in a new thread
-DWORD WINAPI McpToolThread(LPVOID lpParam);
+// The main function for the named pipe server thread.
+// It creates a pipe, waits for a client, and processes commands.
+DWORD WINAPI NamedPipeServerThread(LPVOID lpParam) {
+    char buffer[1024];
+    DWORD dwRead;
 
-// Placeholder function for processing received MCP requests (JSON strings)
-// In a real implementation, this would parse JSON, dispatch methods, and interact with the target process.
-void ProcessMcpRequest(const std::string& requestJson);
+    // Create the named pipe server instance.
+    HANDLE hPipe = CreateNamedPipe(
+        TEXT("\\\\.\\pipe\\CalculatorInputPipe"), // Pipe name
+        PIPE_ACCESS_DUPLEX,                      // Duplex mode (read/write)
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, // Byte stream, blocking waits
+        1,                                       // Maximum pipe instances (1 for this example)
+        sizeof(buffer),                          // Output buffer size
+        sizeof(buffer),                          // Input buffer size
+        0,                                       // Default timeout (no timeout for wait)
+        NULL);                                   // Default security attributes
 
-// --- Main DLL Entry Point ---
+    if (hPipe == INVALID_HANDLE_VALUE) {
+        // Error creating pipe. Handle appropriately (logging, etc.).
+        return 1;
+    }
+
+    // Main server loop. Continues until g_bRunServer is set to false.
+    while (g_bRunServer) {
+        // Wait for a client to connect to the pipe. This is a blocking call.
+        if (ConnectNamedPipe(hPipe, NULL) != FALSE) {
+            // Client connected. Now read commands from the pipe.
+            // Loop continues as long as ReadFile is successful.
+            while (ReadFile(hPipe, buffer, sizeof(buffer) - 1, &dwRead, NULL) != FALSE) {
+                // Null-terminate the received data.
+                buffer[dwRead] = '\0';
+                std::string command(buffer);
+
+                // Process commands. Currently only "TYPE:" is supported.
+                if (command.rfind("TYPE:", 0) == 0) { // Checks if command starts with "TYPE:"
+                    std::string textToType = command.substr(5); // Extract text after "TYPE:"
+                    // Send the extracted text to the target window.
+                    SendTextToWindow(textToType);
+                }
+                // Add handling for other command types here in the future.
+            }
+        }
+        // Client disconnected or an error occurred during ReadFile.
+        // Disconnect the pipe instance to allow another client connection.
+        DisconnectNamedPipe(hPipe);
+    }
+
+    // Server loop is stopping. Clean up the pipe handle.
+    CloseHandle(hPipe);
+    return 0;
+}
+
+// DllMain is the entry point for the DLL.
 BOOL APIENTRY DllMain(HMODULE hModule,
     DWORD  ul_reason_for_call,
-    LPVOID lpReserved)
-{
-    switch (ul_reason_for_call)
-    {
+    LPVOID lpReserved) {
+    switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
-        g_hModule = hModule;
-        // Disable thread attach/detach notifications for performance
+        // This is called when the DLL is loaded into the process.
+        // Disable thread library calls to optimize for this simple DLL.
         DisableThreadLibraryCalls(hModule);
 
-        Log(LOG_INFO, "MCP_Tool.dll attached to process %lu.", GetCurrentProcessId());
-
-        // Create the event used to signal the worker thread to exit
-        g_hExitEvent = CreateEvent(NULL, TRUE, FALSE, NULL); // Manual-reset, initially non-signaled
-        if (g_hExitEvent == NULL) {
-            LogWinError("CreateEvent for exit event");
-            // Log system is not fully initialized yet, may fail.
-            return FALSE; // Indicate initialization failure
-        }
-
-        // Create the main worker thread
-        g_hMainLogicThread = CreateThread(
-            NULL,              // Default security attributes
-            0,                 // Default stack size
-            McpToolThread,     // Thread function
-            hModule,           // Argument to the thread function (DLL handle)
-            0,                 // Creation flags (0 = run immediately)
-            NULL);             // Optional output for thread ID
-
-        if (g_hMainLogicThread == NULL) {
-            LogWinError("CreateThread for main logic thread");
-            CloseHandle(g_hExitEvent);
-            g_hExitEvent = NULL;
-            return FALSE; // Indicate initialization failure
-        }
-
-        Log(LOG_INFO, "Main logic thread created successfully.");
-        break;
-
-    case DLL_THREAD_ATTACH:
-        // Disabled by DisableThreadLibraryCalls
-        break;
-
-    case DLL_THREAD_DETACH:
-        // Disabled by DisableThreadLibraryCalls
+        // Create a new thread to run the named pipe server.
+        // This is essential so the DllMain function returns quickly,
+        // allowing the host process to continue execution without blocking.
+        g_hServerThread = CreateThread(NULL, 0, NamedPipeServerThread, NULL, 0, NULL);
         break;
 
     case DLL_PROCESS_DETACH:
-        Log(LOG_INFO, "MCP_Tool.dll detaching from process %lu.", GetCurrentProcessId());
+        // This is called when the DLL is being unloaded from the process.
+        // Perform necessary cleanup.
+        if (g_bRunServer) {
+            // Signal the server thread to terminate its main loop.
+            g_bRunServer = false;
 
-        // Signal the worker thread to exit
-        if (g_hExitEvent != NULL) {
-            Log(LOG_DEBUG, "Signaling main logic thread to exit.");
-            SetEvent(g_hExitEvent);
-        }
+            // To unblock the ConnectNamedPipe call in the server thread's loop,
+            // we initiate a client connection from within the same process.
+            // CreateFile will connect to the waiting pipe instance, allowing
+            // ConnectNamedPipe to return, the loop condition (g_bRunServer)
+            // to be checked, and the thread to exit gracefully.
+            HANDLE hPipeClient = CreateFile(
+                TEXT("\\\\.\\pipe\\CalculatorInputPipe"),
+                GENERIC_READ | GENERIC_WRITE,
+                0, NULL, OPEN_EXISTING, 0, NULL);
 
-        // Wait for the worker thread to finish (with a timeout)
-        if (g_hMainLogicThread != NULL) {
-            Log(LOG_DEBUG, "Waiting for main logic thread to finish...");
-            // Choose a reasonable timeout. INFINITE might hang if thread doesn't exit.
-            // 5 seconds is arbitrary, adjust based on expected cleanup time.
-            DWORD wait_status = WaitForSingleObject(g_hMainLogicThread, 5000);
-            if (wait_status == WAIT_OBJECT_0) {
-                Log(LOG_INFO, "Main logic thread exited cleanly.");
+            if (hPipeClient != INVALID_HANDLE_VALUE) {
+                // Close the client handle immediately; we only needed to unblock the server.
+                CloseHandle(hPipeClient);
             }
-            else if (wait_status == WAIT_TIMEOUT) {
-                Log(LOG_WARN, "Main logic thread did not exit within timeout.");
-                // TerminateThread is dangerous, use only as a last resort.
-                // If the thread is stuck (e.g., in blocking I/O), termination might be necessary
-                // but can leave resources in an inconsistent state.
-                // Log(LOG_WARN, "Attempting to terminate main logic thread.");
-                // TerminateThread(g_hMainLogicThread, 0); 
+
+            // Wait for the server thread to finish execution.
+            // Use a timeout (e.g., 5000 ms) in production code to avoid hangs,
+            // but INFINITE is used here for simplicity in this example.
+            if (g_hServerThread != NULL) {
+                WaitForSingleObject(g_hServerThread, INFINITE);
+                CloseHandle(g_hServerThread);
+                g_hServerThread = NULL;
             }
-            else {
-                LogWinError("WaitForSingleObject on main logic thread");
-            }
-            CloseHandle(g_hMainLogicThread);
-            g_hMainLogicThread = NULL;
         }
+        break;
 
-        // Close the exit event handle
-        if (g_hExitEvent != NULL) {
-            CloseHandle(g_hExitEvent);
-            g_hExitEvent = NULL;
-        }
-
-        // Perform other resource cleanup here (e.g., close network connections, free memory)
-        // ... SSE client cleanup placeholder ...
-
-        // Close log file
-        if (g_logFile.is_open()) {
-            g_logFile.close();
-        }
-
-        // Note: Logs after g_logFile.close() will not be written to the file.
+    case DLL_THREAD_ATTACH:
+    case DLL_THREAD_DETACH:
+        // These cases are not used in this simple DLL.
         break;
     }
-    return TRUE; // Success
+    // Return TRUE to indicate successful processing.
+    return TRUE;
 }
-
-// --- Main Logic Thread Implementation ---
-DWORD WINAPI McpToolThread(LPVOID lpParam)
-{
-    // HMODULE hDLL = (HMODULE)lpParam; // Can use this if needed
-
-    Log(LOG_INFO, "MCP Tool main logic thread started.");
-
-    // --- SSE Communication Placeholder ---
-    // This is where you would initialize and manage the SSE client connection.
-    // Recommended library: cpp-httplib (single header, relatively easy to integrate)
-    // Alternatively: libcurl (more robust, but requires library files)
-
-    Log(LOG_INFO, "SSE client initialization placeholder...");
-    // Example structure using pseudocode for a hypothetical SSE client library:
-    // auto sse_client = new SseClient("http://localhost:8080/sse_endpoint"); // Replace with actual controller URL
-
-    // Set up callback for receiving events
-    // sse_client->on_event = [](const SseEvent& event) {
-    //     if (event.name == "mcp_request" && !event.data.empty()) {
-    //         Log(LOG_DEBUG, "Received SSE event: %s", event.data.c_str());
-    //         ProcessMcpRequest(event.data); // Pass the JSON data to the handler
-    //     } else {
-    //         Log(LOG_DEBUG, "Received non-MCP SSE event or empty data. Event ID: %s, Event Name: %s", event.id.c_str(), event.name.c_str());
-    //     }
-    // };
-
-    // Set up error callback
-    // sse_client->on_error = [](const SseError& error) {
-    //     Log(LOG_ERROR, "SSE client error: %s", error.message.c_str());
-    //     // Implement reconnection logic here if needed
-    // };
-
-    // Start the SSE connection. This might be a blocking call or run its own internal thread.
-    // If it's blocking, this thread would essentially become the SSE listening thread.
-    // If non-blocking or runs its own thread, the loop below continues for other tasks.
-    // sse_client->connect(); // Pseudocode
-
-    // --- Main Loop ---
-    // The thread continues running until the exit event is signaled by DllMain(DLL_PROCESS_DETACH)
-    Log(LOG_INFO, "Entering main thread loop...");
-    // Use WaitForSingleObject with a timeout to periodically check the exit event
-    // while (WaitForSingleObject(g_hExitEvent, 100) != WAIT_OBJECT_0) { 
-    //     // This loop can be used for:
-    //     // 1. Keeping the thread alive if the SSE client runs its own thread.
-    //     // 2. Performing periodic tasks (e.g., gathering specific context data if not event-driven).
-    //     // 3. Checking internal queues or states.
-
-    //     // If the SSE client's 'connect' call is blocking, this loop won't be reached until disconnection.
-    //     // In that case, the SSE client's event loop is the main loop. The WaitForSingleObject
-    //     // inside this function would then be used within the SSE client's logic to check the exit event.
-
-    //     // Example: Periodically check target process state (if needed, and safely)
-    //     // CheckProcessState(); // Placeholder
-
-    //     // In a blocking SSE client model, the SSE library's event loop would be here.
-    //     // The loop would look something like:
-    //     // while (!IsExitEventSignaled() && sse_client->is_connected()) {
-    //     //     sse_client->listen_for_events(); // This would block until an event or error
-    //     // }
-
-    //     // Log(LOG_DEBUG, "Thread loop iteration..."); // Log sparingly in loops
-    // }
-
-    // Simplified placeholder loop: Keep the thread alive by waiting on the exit event.
-    // In a real implementation with a non-blocking SSE client or internal message queue,
-    // the loop would involve processing messages or events.
-    // For a blocking SSE client, the thread would block in the client's connect/listen call.
-    // This placeholder version waits indefinitely until signaled.
-    WaitForSingleObject(g_hExitEvent, INFINITE);
-
-    Log(LOG_INFO, "Main thread loop exited.");
-
-
-    // --- Cleanup ---
-    Log(LOG_INFO, "Cleaning up main logic thread resources...");
-
-    // Disconnect and cleanup SSE client
-    // if (sse_client) {
-    //     sse_client->disconnect(); // Pseudocode
-    //     delete sse_client;
-    //     sse_client = nullptr;
-    // }
-    Log(LOG_INFO, "SSE client cleanup placeholder complete.");
-
-    // Perform other thread-specific cleanup
-
-    Log(LOG_INFO, "MCP Tool main logic thread exiting.");
-    return 0; // Thread exits cleanly
-}
-
-// --- MCP Protocol Handling Placeholder ---
-// This function is called when a new SSE 'data' chunk (assumed to be a JSON-RPC request) is received.
-void ProcessMcpRequest(const std::string& requestJson)
-{
-    Log(LOG_INFO, "Processing MCP Request: %s", requestJson.c_str());
-
-    // --- JSON Parsing Placeholder ---
-    // Use a JSON library like nlohmann/json to parse the requestJson string.
-    // try {
-    //     json request = json::parse(requestJson);
-    //
-    //     // --- Request Dispatch Placeholder ---
-    //     if (request.contains("method") && request["method"].is_string()) {
-    //         std::string method = request["method"];
-    //         json params = request.contains("params") ? request["params"] : json::object(); // Optional params
-    //         json id = request.contains("id") ? request["id"] : json(); // Optional ID for notification vs request
-    //
-    //         Log(LOG_DEBUG, "MCP Method: %s", method.c_str());
-    //         // Implement logic to call the appropriate handler function based on 'method'
-    //         if (method == "getContext") {
-    //             Log(LOG_INFO, "Calling getContext handler...");
-    //             // json result = HandleGetContext(id, params); // Placeholder handler call
-    //         } else if (method == "listItems") {
-    //             Log(LOG_INFO, "Calling listItems handler...");
-    //             // json result = HandleListItems(id, params); // Placeholder handler call
-    //         }
-    //         // Add more method handlers here...
-    //         else {
-    //             Log(LOG_WARN, "Unknown MCP method: %s", method.c_str());
-    //             // SendMethodNotFoundResponse(id, method); // Send JSON-RPC error response
-    //         }
-    //     } else {
-    //         Log(LOG_WARN, "Received non-JSON-RPC data or missing method field.");
-    //         // SendParseErrorResponse(json()); // Send JSON-RPC error response for invalid request
-    //     }
-    // } catch (const json::parse_error& e) {
-    //     Log(LOG_ERROR, "JSON parsing error: %s. Original data: %s", e.what(), requestJson.c_str());
-    //     // SendParseErrorResponse(json()); // Send JSON-RPC error response
-    // } catch (const std::exception& e) {
-    //      Log(LOG_ERROR, "Error processing MCP request: %s. Original data: %s", e.what(), requestJson.c_str());
-    //      // SendInternalErrorResponse(json()); // Send JSON-RPC error response
-    // }
-
-    // --- Target Process Interaction Placeholder ---
-    // Functions like HandleGetContext, HandleListItems etc. would contain the code
-    // to interact with the target process. This is highly specific to the target.
-    // Examples:
-    // - Reading/writing memory locations (requires knowing addresses and structures)
-    // - Calling exported functions from the target process
-    // - Hooking functions to intercept calls or data
-    // - Sending/receiving window messages
-
-    Log(LOG_DEBUG, "Target process interaction logic placeholder within method handlers...");
-
-
-    // --- MCP Response Sending Placeholder ---
-    // After processing the request and getting a result or error, construct a JSON-RPC response
-    // and send it back to the MCP Controller. The design document suggests HTTP POST for responses.
-    // This would involve using the HTTP client library again, but for an outgoing POST request.
-
-    // Example (pseudocode):
-    // void SendMcpResponse(const json& id, const json& response_payload) { // response_payload is result or error
-    //    json response;
-    //    response["jsonrpc"] = "2.0";
-    //    if (!id.is_null()) response["id"] = id;
-    //    // Determine if payload is result or error and add accordingly
-    //    if (response_payload.contains("code") && response_payload.contains("message")) { // Simple check for error format
-    //        response["error"] = response_payload;
-    //    } else {
-    //        response["result"] = response_payload;
-    //    }
-    //
-    //    std::string response_str = response.dump(); // Serialize JSON to string
-    //    Log(LOG_DEBUG, "Sending MCP Response: %s", response_str.c_str());
-    //
-    //    // Use HTTP client to POST response_str to the controller's response endpoint
-    //    // sse_client->post("/response_endpoint", "application/json", response_str); // Pseudocode
-    // }
-    Log(LOG_DEBUG, "MCP response sending logic placeholder...");
-}
-
-// --- Placeholder for Target Process Interaction Functions (Example) ---
-// These would need to be implemented based on the specific target application.
-// They are NOT part of the core framework but are where application-specific logic resides.
-// Placeholder function signatures used in ProcessMcpRequest pseudocode:
-// json HandleGetContext(const json& id, const json& params);
-// json HandleListItems(const json& id, const json& params);
-
-
-// --- Utility to check if exit event is signaled (useful for sub-loops) ---
-bool IsExitEventSignaled() {
-    return WaitForSingleObject(g_hExitEvent, 0) == WAIT_OBJECT_0;
-}
-
-// Note: Actual SSE client and JSON library code would be included here or in separate files
-// and linked. The placeholders show where that logic fits.
-// For cpp-httplib, you'd typically include the single header file:
-// #include "httplib.h"
-// And potentially nlohmann/json:
-// #include "json.hpp"
