@@ -55,14 +55,25 @@ void SendTextToWindow(const std::string& text) {
     }
 
     // Iterate through each character in the string and post WM_CHAR messages.
-    // Note: This assumes the target application correctly processes WM_CHAR
-    // messages with character codes sent this way. For full Unicode support,
-    // the input protocol and this function might need to handle UTF-16.
     for (char c : text) {
         PostMessageW(g_hTargetWnd, WM_CHAR, (WPARAM)c, 0);
         Sleep(25); // Small delay to allow target to process
     }
 }
+
+// *** NEW FUNCTION: Converts a WCHAR string to a UTF-8 std::string ***
+std::string WcharToUtf8(const WCHAR* wstr) {
+    if (!wstr) return "";
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
+    std::string strTo(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wstr, -1, &strTo[0], size_needed, NULL, NULL);
+    // The result from WideCharToMultiByte includes the null terminator, remove it.
+    if (!strTo.empty() && strTo.back() == '\0') {
+        strTo.pop_back();
+    }
+    return strTo;
+}
+
 
 // The main function for the named pipe server thread.
 // lpParam receives a pointer to the allocated WCHAR pipe name string.
@@ -70,139 +81,119 @@ DWORD WINAPI NamedPipeServerThread(LPVOID lpParam) {
     // Cast lpParam to the WCHAR pipe name string pointer.
     const WCHAR* pipeName = static_cast<const WCHAR*>(lpParam);
 
-    char buffer[1024]; // Buffer for incoming command string (assuming non-Unicode protocol commands)
+    char buffer[1024];
     DWORD dwRead;
 
-    // Create the named pipe server instance using the dynamic name.
-    HANDLE hPipe = CreateNamedPipeW( // Use CreateNamedPipeW for WCHAR pipe name
-        pipeName,                    // Dynamic Pipe name (e.g., "\\.\pipe\GenericInputPipe_<PID>")
-        PIPE_ACCESS_DUPLEX,          // Duplex mode (read/write)
-        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, // Byte stream, blocking waits
-        1,                           // Maximum pipe instances (1 per process/pipe name)
-        sizeof(buffer),              // Output buffer size
-        sizeof(buffer),              // Input buffer size
-        0,                           // Default timeout (no timeout for wait)
-        NULL);                       // Default security attributes
+    HANDLE hPipe = CreateNamedPipeW(
+        pipeName,
+        PIPE_ACCESS_DUPLEX,          // *** Duplex mode is essential for two-way communication ***
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1,
+        sizeof(buffer),
+        sizeof(buffer),
+        0,
+        NULL);
 
-    // The pipe name string memory is no longer needed by the thread after the pipe is created.
-    // Free the allocated memory regardless of CreateNamedPipeW success.
     delete[] pipeName;
-    lpParam = NULL; // Clear pointer
+    lpParam = NULL;
 
     if (hPipe == INVALID_HANDLE_VALUE) {
-        // Failed to create pipe. In a real scenario, log this error.
-        // For this example, we just exit the thread.
-        // OutputDebugString(L"Failed to create named pipe for PID "); // Example debug output
-        // OutputDebugString(std::to_wstring(GetCurrentProcessId()).c_str());
-        // OutputDebugString(L". Error: ");
-        // OutputDebugString(std::to_wstring(GetLastError()).c_str());
-        // OutputDebugString(L"\n");
         return 1;
     }
 
-    // Main server loop. Continues until g_bRunServer is set to false.
     while (g_bRunServer) {
-        // Wait for a client to connect to the pipe. This is a blocking call.
         if (ConnectNamedPipe(hPipe, NULL) != FALSE) {
-            // Client connected. Read commands from the pipe.
-            // Loop continues as long as ReadFile is successful AND we are still running.
             while (g_bRunServer && ReadFile(hPipe, buffer, sizeof(buffer) - 1, &dwRead, NULL) != FALSE) {
-                // Null-terminate the received data.
                 buffer[dwRead] = '\0';
-                std::string command(buffer); // Convert buffer to std::string
+                std::string command(buffer);
 
-                // Process commands. Currently only "TYPE:" is supported.
                 if (command.rfind("TYPE:", 0) == 0) {
-                    std::string textToType = command.substr(5); // Extract text after "TYPE:"
+                    std::string textToType = command.substr(5);
                     SendTextToWindow(textToType);
                 }
-                // Add handling for other command types here in the future.
+                // *** START: MODIFICATION FOR BIDIRECTIONAL COMMUNICATION ***
+                else if (command == "QUERY_INFO") {
+                    // 1. Ensure we have the target window handle
+                    if (g_hTargetWnd == NULL) {
+                        FindMainWindow();
+                    }
+
+                    // 2. Prepare the response data
+                    WCHAR windowTitle[256] = { 0 };
+                    if (g_hTargetWnd != NULL) {
+                        GetWindowTextW(g_hTargetWnd, windowTitle, 255);
+                    }
+
+                    std::string titleUtf8 = WcharToUtf8(windowTitle);
+
+                    std::stringstream ss;
+                    ss << "PID:" << GetCurrentProcessId()
+                        << ";HWND:" << reinterpret_cast<uintptr_t>(g_hTargetWnd)
+                        << ";Title:" << (titleUtf8.empty() ? "N/A" : titleUtf8)
+                        << ";";
+
+                    std::string response = ss.str();
+
+                    // 3. Write the response back to the pipe
+                    DWORD dwWritten;
+                    WriteFile(
+                        hPipe,
+                        response.c_str(),
+                        (DWORD)response.length(),
+                        &dwWritten,
+                        NULL);
+                }
+                // *** END: MODIFICATION FOR BIDIRECTIONAL COMMUNICATION ***
             }
         }
-        // Client disconnected, an error occurred during ReadFile, or g_bRunServer became false.
-        // Disconnect the pipe instance to allow another client connection.
         DisconnectNamedPipe(hPipe);
     }
 
-    // Server loop is stopping. Clean up the pipe handle.
     CloseHandle(hPipe);
     return 0;
 }
 
 // DllMain is the entry point for the DLL.
+// ... (The rest of DllMain remains unchanged) ...
 BOOL APIENTRY DllMain(HMODULE hModule,
     DWORD  ul_reason_for_call,
     LPVOID lpReserved) {
     switch (ul_reason_for_call) {
-        // Fix: Enclose the case body in curly braces to provide proper scope for variable declarations
     case DLL_PROCESS_ATTACH:
-    { // Start of the fix block
-        // Called when the DLL is loaded into the process.
+    {
         DisableThreadLibraryCalls(hModule);
-
-        // Get current process ID.
         DWORD currentPid = GetCurrentProcessId();
-
-        // Construct the dynamic pipe name using PID for WCHAR string.
         std::wstring pipeNameW = std::wstring(PIPE_NAME_BASE) + std::to_wstring(currentPid);
-
-        // Allocate memory for the wide pipe name string on the heap
-        // and copy the string. The thread will own and free this memory.
         WCHAR* dynamicPipeName = new WCHAR[pipeNameW.length() + 1];
         if (dynamicPipeName) {
-            // Use secure wide string copy
-            // Ensure wcscpy_s is available or use wcscpy with size check in older environments if necessary
-            // For modern C++, wcscpy_s is preferred for safety.
             wcscpy_s(dynamicPipeName, pipeNameW.length() + 1, pipeNameW.c_str());
-
-            // Create a new thread to run the named pipe server, passing the dynamic pipe name.
             g_hServerThread = CreateThread(
-                NULL,              // Default security attributes
-                0,                 // Default stack size
-                NamedPipeServerThread, // Thread function
-                dynamicPipeName,   // Argument to thread function (dynamic pipe name)
-                0,                 // Creation flags (0 for run immediately)
-                NULL);             // Thread identifier (not used)
-
-            // If thread creation fails, we must free the allocated memory here.
+                NULL,
+                0,
+                NamedPipeServerThread,
+                dynamicPipeName,
+                0,
+                NULL);
             if (g_hServerThread == NULL) {
                 delete[] dynamicPipeName;
-                // In a real scenario, log thread creation failure.
             }
         }
-        // If dynamicPipeName allocation failed (dynamicPipeName is NULL), g_hServerThread remains NULL, and no thread is created.
-        // In a real scenario, log memory allocation failure.
-    } // End of the fix block
+    }
     break;
 
     case DLL_PROCESS_DETACH:
-        // Called when the DLL is being unloaded from the process.
-        // Signal the server thread to stop and unblock it if necessary.
         if (g_hServerThread != NULL) {
-            // Signal termination.
             g_bRunServer = false;
-
-            // Reconstruct the dynamic pipe name to connect and unblock the server thread's ConnectNamedPipeW call.
-            // Get PID again in case of complex process scenarios (unlikely but safe).
             DWORD currentPid = GetCurrentProcessId();
             std::wstring pipeNameW = std::wstring(PIPE_NAME_BASE) + std::to_wstring(currentPid);
-
-            // Create a temporary client handle to the pipe.
             HANDLE hPipeClient = CreateFileW(
                 pipeNameW.c_str(),
                 GENERIC_READ | GENERIC_WRITE,
                 0, NULL, OPEN_EXISTING, 0, NULL);
-
-            // Close the temporary client handle immediately.
             if (hPipeClient != INVALID_HANDLE_VALUE) {
                 CloseHandle(hPipeClient);
             }
-
-            // Wait for the server thread to finish execution with a timeout.
-            // Using a timeout prevents the process from hanging indefinitely if the thread fails to exit.
-            WaitForSingleObject(g_hServerThread, 5000); // Wait up to 5 seconds
-
-            // Close the server thread handle.
+            WaitForSingleObject(g_hServerThread, 5000);
             CloseHandle(g_hServerThread);
             g_hServerThread = NULL;
         }
@@ -210,9 +201,7 @@ BOOL APIENTRY DllMain(HMODULE hModule,
 
     case DLL_THREAD_ATTACH:
     case DLL_THREAD_DETACH:
-        // Thread-level notifications are not needed for this simple DLL.
         break;
     }
-    // Return TRUE to indicate successful processing.
     return TRUE;
 }
