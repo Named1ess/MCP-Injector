@@ -12,7 +12,33 @@ PIPE_NAME_BASE = r'\\.\pipe\GenericInputPipe_'
 # Prefix for the 'type' command expected by the C++ DLL.
 COMMAND_TYPE_PREFIX = "TYPE:"
 # The expected name of the injected DLL file to search for in processes.
-INJECTED_DLL_NAME = "MCP_Tool.dll" # Or whatever the refactored DLL is named
+INJECTED_DLL_NAME = "MCP_Tool.dll"  # Or whatever the refactored DLL is named
+
+# *** 要广播的消息内容 ***
+#BROADCAST_MESSAGE = "1314"  # 在这里设置要广播的内容
+
+
+def get_broadcast_message(message):
+    """
+    生成要广播的内容的函数
+
+    Args:
+        message: 要广播的消息内容
+
+    Returns:
+        str: 要广播的消息内容
+    """
+    # 这里可以根据需要修改消息内容
+    # 例如：可以是当前时间、随机内容、从配置文件读取、API调用结果等
+
+    message_content = f"{message}"  # 使用传入的参数
+
+    # 也可以是动态内容，例如：
+    # message_content = f"Current time: {time.strftime('%Y-%m-%d %H:%M:%S')} - {message}"
+    # message_content = f"自定义广播内容: {message}"
+
+    return message_content
+
 
 # --- Helper Function for Process Discovery ---
 def find_injected_processes(dll_name: str = INJECTED_DLL_NAME) -> list[int]:
@@ -49,12 +75,13 @@ def find_injected_processes(dll_name: str = INJECTED_DLL_NAME) -> list[int]:
             # Ignore processes that no longer exist, deny access, or are zombies
             continue
         except Exception as e:
-             # Catch any other unexpected errors during process/module access
-             print(f"[{time.strftime('%H:%M:%S')}] Error accessing process {proc.pid}: {e}")
-             continue
+            # Catch any other unexpected errors during process/module access
+            print(f"[{time.strftime('%H:%M:%S')}] Error accessing process {proc.pid}: {e}")
+            continue
 
     print(f"[{time.strftime('%H:%M:%S')}] Scan complete. Found {len(injected_pids)} potential target processes.")
     return injected_pids
+
 
 # --- Main Controller Class ---
 class ProcessInputController:
@@ -63,7 +90,8 @@ class ProcessInputController:
     and control them via dynamic named pipe connections.
     """
 
-    def __init__(self, dll_name: str = INJECTED_DLL_NAME, pipe_name_base: str = PIPE_NAME_BASE, connect_timeout_ms: int = 5000):
+    def __init__(self, dll_name: str = INJECTED_DLL_NAME, pipe_name_base: str = PIPE_NAME_BASE,
+                 connect_timeout_ms: int = 5000):
         """
         Initializes the controller, discovers injected processes,
         and attempts to connect to their dynamic named pipes.
@@ -117,32 +145,35 @@ class ProcessInputController:
                 if error_code == win32pipe.ERROR_PIPE_BUSY:
                     # Pipe is busy, wait up to the remaining timeout
                     remaining_timeout_ms = max(0, int(timeout_ms - elapsed_ms))
-                    print(f"[{time.strftime('%H:%M:%S')}] Pipe {pipe_name} is busy. Waiting up to {remaining_timeout_ms}ms...")
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] Pipe {pipe_name} is busy. Waiting up to {remaining_timeout_ms}ms...")
                     if win32pipe.WaitNamedPipe(pipe_name, remaining_timeout_ms) == 0:
                         # Wait timed out
-                        print(f"[{time.strftime('%H:%M:%S')}] WaitNamedPipe timed out for {pipe_name} after {elapsed_ms:.2f}ms.")
-                        return None # Indicate failure to connect within timeout
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] WaitNamedPipe timed out for {pipe_name} after {elapsed_ms:.2f}ms.")
+                        return None  # Indicate failure to connect within timeout
                     # Wait succeeded, pipe is available, loop will retry CreateFile
                     continue
-                elif error_code == 2: # ERROR_FILE_NOT_FOUND
+                elif error_code == 2:  # ERROR_FILE_NOT_FOUND
                     # Pipe doesn't exist yet. Retry if within timeout.
                     if elapsed_ms < timeout_ms:
                         # print(f"[{time.strftime('%H:%M:%S')}] Pipe {pipe_name} not found. Retrying...")
-                        time.sleep(0.1) # Wait a bit before retrying
+                        time.sleep(0.1)  # Wait a bit before retrying
                         continue
                     else:
-                        print(f"[{time.strftime('%H:%M:%S')}] Failed to connect to pipe {pipe_name}: Pipe not found after {elapsed_ms:.2f}ms.")
-                        return None # Indicate failure
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] Failed to connect to pipe {pipe_name}: Pipe not found after {elapsed_ms:.2f}ms.")
+                        return None  # Indicate failure
                 else:
                     # Handle other potential errors during CreateFile
                     print(f"[{time.strftime('%H:%M:%S')}] Error connecting to pipe {pipe_name}: {e}")
-                    return None # Indicate failure
+                    return None  # Indicate failure
 
             except Exception as e:
-                 # Catch any other unexpected errors
-                 print(f"[{time.strftime('%H:%M:%S')}] An unexpected error occurred during pipe connection to {pipe_name}: {e}")
-                 return None # Indicate failure
-
+                # Catch any other unexpected errors
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] An unexpected error occurred during pipe connection to {pipe_name}: {e}")
+                return None  # Indicate failure
 
     def _discover_and_connect(self):
         """
@@ -155,7 +186,8 @@ class ProcessInputController:
             print(f"[{time.strftime('%H:%M:%S')}] No processes found with injected DLL '{self.dll_name}'.")
             return
 
-        print(f"[{time.strftime('%H:%M:%S')}] Found {len(injected_pids)} potential target processes. Attempting connections...")
+        print(
+            f"[{time.strftime('%H:%M:%S')}] Found {len(injected_pids)} potential target processes. Attempting connections...")
 
         successful_connections = 0
         for pid in injected_pids:
@@ -170,10 +202,12 @@ class ProcessInputController:
                 # _connect_single_pipe handles printing failure messages
             except Exception as e:
                 # Catch any unexpected errors during connection *attempt* for this PID
-                print(f"[{time.strftime('%H:%M:%S')}] Unexpected error during connection attempt for PID {pid} pipe {dynamic_pipe_name}: {e}")
-                continue # Move to the next PID
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] Unexpected error during connection attempt for PID {pid} pipe {dynamic_pipe_name}: {e}")
+                continue  # Move to the next PID
 
-        print(f"[{time.strftime('%H:%M:%S')}] Connection phase complete. Successfully connected to {successful_connections} process(es).")
+        print(
+            f"[{time.strftime('%H:%M:%S')}] Connection phase complete. Successfully connected to {successful_connections} process(es).")
 
     def _send_command_to_handle(self, handle: object, command: str) -> bool:
         """
@@ -203,14 +237,14 @@ class ProcessInputController:
             error_code, error_message = e.args
             # A common error here is 109 (ERROR_BROKEN_PIPE), indicating the server disconnected.
             # print(f"[{time.strftime('%H:%M:%S')}] Error sending command via handle {handle}: {e}")
-            if error_code == 109: # ERROR_BROKEN_PIPE
+            if error_code == 109:  # ERROR_BROKEN_PIPE
                 # Pipe is broken for this specific handle. It needs to be removed.
-                pass # The calling broadcast method will handle removal
+                pass  # The calling broadcast method will handle removal
             return False
         except Exception as e:
-            print(f"[{time.strftime('%H:%M:%M')}] An unexpected error occurred while sending command via handle {handle}: {e}")
+            print(
+                f"[{time.strftime('%H:%M:%M')}] An unexpected error occurred while sending command via handle {handle}: {e}")
             return False
-
 
     def broadcast_command(self, command_string: str):
         """
@@ -224,7 +258,8 @@ class ProcessInputController:
             print(f"[{time.strftime('%H:%M:%S')}] No processes currently connected to broadcast command.")
             return
 
-        print(f"[{time.strftime('%H:%M:%S')}] Broadcasting command '{command_string}' to {len(self.pipe_handles)} process(es)...")
+        print(
+            f"[{time.strftime('%H:%M:%S')}] Broadcasting command '{command_string}' to {len(self.pipe_handles)} process(es)...")
 
         pids_to_remove = []
         # Iterate over a copy of the dictionary items as we might modify the original dict
@@ -236,13 +271,14 @@ class ProcessInputController:
                     # Attempt to close the broken handle immediately
                     win32file.CloseHandle(handle)
                 except Exception as e:
-                    print(f"[{time.strftime('%H:%M:%S')}] Error closing handle for PID {pid} during broadcast failure: {e}")
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] Error closing handle for PID {pid} during broadcast failure: {e}")
 
         # Clean up disconnected handles from the dictionary
         for pid in pids_to_remove:
-            if pid in self.pipe_handles: # Double check it hasn't been removed already
-                 del self.pipe_handles[pid]
-                 print(f"[{time.strftime('%H:%M:%S')}] Removed disconnected PID {pid}.")
+            if pid in self.pipe_handles:  # Double check it hasn't been removed already
+                del self.pipe_handles[pid]
+                print(f"[{time.strftime('%H:%M:%S')}] Removed disconnected PID {pid}.")
 
         print(f"[{time.strftime('%H:%M:%S')}] Broadcast complete. {len(self.pipe_handles)} processes remain connected.")
 
@@ -255,13 +291,32 @@ class ProcessInputController:
             text: The string of characters to simulate typing.
         """
         if not isinstance(text, str):
-             print(f"[{time.strftime('%H:%M:%S')}] Error: Input to send_text must be a string.")
-             return
+            print(f"[{time.strftime('%H:%M:%S')}] Error: Input to send_text must be a string.")
+            return
 
         command = f"{COMMAND_TYPE_PREFIX}{text}"
         # The broadcast_command method handles sending and error reporting per pipe
         self.broadcast_command(command)
 
+    def broadcast_single_message(self, message_to_send):
+        """
+        广播单条来自函数变量的消息
+
+        Args:
+            message_to_send: 要广播的消息内容
+        """
+        # 从函数中获取要广播的内容（传入参数）
+        message = get_broadcast_message(message_to_send)
+
+        current_connected_pids = self.get_connected_pids()
+        if not current_connected_pids:
+            print(f"[{time.strftime('%H:%M:%S')}] 没有连接的进程，无法广播")
+            return False
+
+        print(f"[{time.strftime('%H:%M:%S')}] 准备广播消息: '{message}'")
+        self.send_text(message)
+        print(f"[{time.strftime('%H:%M:%S')}] 消息广播完成")
+        return True
 
     def close(self):
         """
@@ -272,7 +327,7 @@ class ProcessInputController:
             return
 
         print(f"[{time.strftime('%H:%M:%S')}] Closing all {len(self.pipe_handles)} pipe connections...")
-        for pid, handle in list(self.pipe_handles.items()): # Iterate over a copy
+        for pid, handle in list(self.pipe_handles.items()):  # Iterate over a copy
             try:
                 if handle and handle != win32file.INVALID_HANDLE_VALUE:
                     win32file.CloseHandle(handle)
@@ -280,86 +335,61 @@ class ProcessInputController:
             except Exception as e:
                 print(f"[{time.strftime('%H:%M:%S')}] Error closing handle for PID {pid}: {e}")
             finally:
-                 # Ensure it's removed from the dictionary even if closing failed
-                 if pid in self.pipe_handles:
-                      del self.pipe_handles[pid]
+                # Ensure it's removed from the dictionary even if closing failed
+                if pid in self.pipe_handles:
+                    del self.pipe_handles[pid]
 
-        self.pipe_handles = {} # Ensure dictionary is empty
+        self.pipe_handles = {}  # Ensure dictionary is empty
         print(f"[{time.strftime('%H:%M:%S')}] All pipe handles closed.")
 
     def get_connected_pids(self) -> list[int]:
         """Returns a list of PIDs for currently connected processes."""
         return list(self.pipe_handles.keys())
 
-# --- Main Execution Block ---
-if __name__ == "__main__":
+def executeMCP(message):
+    # *** 要广播的消息内容 ***
+    BROADCAST_MESSAGE = f"{message}"  # 在这里设置要广播的内容
     controller = None
     try:
         # Initialize the controller. This will discover and attempt to connect.
-        print("\n--- Initializing Process Input Controller ---")
-        # You might need to adjust the timeout based on how long it takes
-        # your target processes to start and load the DLL after injection.
-        controller = ProcessInputController(connect_timeout_ms=5000) # Wait up to 5 seconds per pipe
+        print("\n--- 初始化进程输入控制器 ---")
+        controller = ProcessInputController(connect_timeout_ms=5000)
 
         connected_pids = controller.get_connected_pids()
         if not connected_pids:
-            print("\n--- No Processes Connected ---")
-            print(f"Could not connect to any processes with the '{INJECTED_DLL_NAME}' DLL.")
-            print("Please ensure the DLL is injected into one or more running processes.")
-            # sys.exit(1) # Exit if no processes found
+            print("\n--- 没有进程连接 ---")
+            print(f"无法连接到任何加载了 '{INJECTED_DLL_NAME}' DLL 的进程。")
+            print("请确保 DLL 已注入到一个或多个正在运行的进程中。")
+            sys.exit(1)
 
         else:
-            print("\n--- Entering Command Loop ---")
-            print(f"Successfully connected to {len(connected_pids)} process(es) with PIDs: {connected_pids}")
-            print("Enter text to broadcast (e.g., 'hello world', '123+45='). Type 'exit' to quit.")
+            print("\n--- 开始广播单条消息 ---")
+            print(f"成功连接到 {len(connected_pids)} 个进程，PID: {connected_pids}")
+            print(f"将要广播的消息: '{BROADCAST_MESSAGE}'")
 
-            while True:
-                try:
-                    user_input = input("> ")
-                    if user_input.lower() == 'exit':
-                        break
+            # 广播单条消息（传入要广播的内容）
+            success = controller.broadcast_single_message(BROADCAST_MESSAGE)
 
-                    if not controller.get_connected_pids():
-                         print(f"[{time.strftime('%H:%M:%S')}] No processes currently connected. Cannot send command.")
-                         # Offer to rescan and reconnect?
-                         # print(f"[{time.strftime('%H:%M:%S')}] Attempting to rescan and reconnect...")
-                         # controller = ProcessInputController(connect_timeout_ms=5000) # Re-initialize to find new/restarted processes
-                         # if not controller.get_connected_pids():
-                         #      print(f"[{time.strftime('%H:%M:%S')}] Still no processes connected.")
-                         # else:
-                         #      print(f"[{time.strftime('%H:%M:%S')}] Reconnected to PIDs: {controller.get_connected_pids()}")
-                         continue
+            if success:
+                print(f"[{time.strftime('%H:%M:%S')}] 广播任务完成")
+            else:
+                print(f"[{time.strftime('%H:%M:%S')}] 广播任务失败")
 
-
-                    # Send the command to all connected processes
-                    controller.send_text(user_input)
-                    current_connected_pids = controller.get_connected_pids()
-                    print(f"[{time.strftime('%H:%M:%S')}] Command sent. {len(current_connected_pids)} processes remain connected.")
-                    if current_connected_pids:
-                         print(f"[{time.strftime('%H:%M:%S')}] Connected PIDs: {current_connected_pids}")
-                    else:
-                         print(f"[{time.strftime('%H:%M:%S')}] All processes disconnected.")
-
-
-                except KeyboardInterrupt:
-                    print("\nKeyboard interrupt detected. Exiting.")
-                    break
-                except Exception as e:
-                    print(f"[{time.strftime('%H:%M:%S')}] An unexpected error occurred during command input/sending: {e}")
-                    # Decide whether to continue or exit on error
-                    # break
-
+    except KeyboardInterrupt:
+        print("\n检测到键盘中断，正在退出...")
     except Exception as e:
-        print(f"\n--- A Fatal Error Occurred During Initialization or Main Loop ---")
-        print(f"Error type: {type(e).__name__}")
-        print(f"Error details: {e}")
-        # Optional: Print traceback for debugging
-        # import traceback
-        # traceback.print_exc()
+        print(f"\n--- 初始化或主循环期间发生致命错误 ---")
+        print(f"错误类型: {type(e).__name__}")
+        print(f"错误详情: {e}")
 
     finally:
         # Ensure all pipe connections are closed when the script finishes
-        print("\n--- Cleaning Up Connections ---")
+        print("\n--- 清理连接 ---")
         if controller:
             controller.close()
-        print("Script finished.")
+        print("脚本结束。")
+
+
+# --- Main Execution Block ---
+if __name__ == "__main__":
+    executeMCP("222")
