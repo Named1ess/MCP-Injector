@@ -8,10 +8,13 @@ import os
 
 # --- Configuration Constants ---
 PIPE_NAME_BASE = r'\\.\pipe\GenericInputPipe_'
-COMMAND_TYPE_PREFIX = "TYPE:"
-# *** 新增: 查询命令 ***
-COMMAND_QUERY_INFO = "QUERY_INFO"
 INJECTED_DLL_NAME = "MCP_Tool.dll"  # 确保这是你实际的 DLL 文件名
+
+# --- Command Prefixes ---
+COMMAND_TYPE_PREFIX = "TYPE:"
+COMMAND_QUERY_INFO = "QUERY_INFO"
+# *** 新增: 菜单命令前缀 ***
+COMMAND_MENU_PREFIX = "MENU:"
 
 
 # ... (get_broadcast_message 和 find_injected_processes 函数保持不变) ...
@@ -42,7 +45,7 @@ def find_injected_processes(dll_name: str = INJECTED_DLL_NAME) -> list[int]:
 
 
 class ProcessInputController:
-    # ... (__init__, _connect_single_pipe, _discover_and_connect, _send_command_to_handle 保持不变) ...
+    # ... (__init__, _connect_single_pipe, _discover_and_connect, _send_command_to_handle, query_process_info 保持不变) ...
     def __init__(self, dll_name: str = INJECTED_DLL_NAME, pipe_name_base: str = PIPE_NAME_BASE,
                  connect_timeout_ms: int = 5000):
         self.dll_name = dll_name
@@ -59,7 +62,7 @@ class ProcessInputController:
             try:
                 handle = win32file.CreateFile(
                     pipe_name,
-                    win32file.GENERIC_READ | win32file.GENERIC_WRITE,  # Read/Write access is crucial
+                    win32file.GENERIC_READ | win32file.GENERIC_WRITE,
                     0, None, win32file.OPEN_EXISTING, 0, None
                 )
                 print(f"[{time.strftime('%H:%M:%S')}] Successfully connected to pipe: {pipe_name}")
@@ -72,7 +75,7 @@ class ProcessInputController:
                     if win32pipe.WaitNamedPipe(pipe_name, remaining_timeout_ms) == 0:
                         return None
                     continue
-                elif error_code == 2:  # ERROR_FILE_NOT_FOUND
+                elif error_code == 2:
                     if elapsed_ms < timeout_ms:
                         time.sleep(0.1)
                         continue
@@ -108,12 +111,12 @@ class ProcessInputController:
         if not handle or handle == win32file.INVALID_HANDLE_VALUE:
             return False
         try:
-            command_bytes = command.encode('utf-8')  # Send as UTF-8
+            command_bytes = command.encode('utf-8')
             bytes_written, _ = win32file.WriteFile(handle, command_bytes)
             return True
         except pywintypes.error as e:
             error_code, _, _ = e.args
-            if error_code == 109:  # ERROR_BROKEN_PIPE
+            if error_code == 109:
                 pass
             else:
                 print(f"[{time.strftime('%H:%M:%S')}] Error sending command via handle {handle}: {e}")
@@ -123,39 +126,19 @@ class ProcessInputController:
                 f"[{time.strftime('%H:%M:%M')}] An unexpected error occurred while sending command via handle {handle}: {e}")
             return False
 
-    # *** START: NEW BIDIRECTIONAL METHOD ***
     def query_process_info(self, pid: int) -> dict | None:
-        """
-        Sends a query command to a specific process and reads the response.
-
-        Args:
-            pid: The process ID to query.
-
-        Returns:
-            A dictionary with process info if successful, None otherwise.
-        """
         if pid not in self.pipe_handles:
             print(f"[{time.strftime('%H:%M:%S')}] Cannot query PID {pid}: Not connected.")
             return None
-
         handle = self.pipe_handles[pid]
         print(f"[{time.strftime('%H:%M:%S')}] Querying info from PID {pid}...")
-
-        # 1. Send the query command
         if not self._send_command_to_handle(handle, COMMAND_QUERY_INFO):
             print(f"[{time.strftime('%H:%M:%S')}] Failed to send query to PID {pid}.")
             return None
-
-        # 2. Read the response from the pipe
         try:
-            # ReadFile will block until data is received from the server (C++ DLL)
-            result_code, data = win32file.ReadFile(handle, 4096)  # Read up to 4KB
-
-            if result_code == 0:  # Success
-                # Decode from bytes to string (using UTF-8) and remove trailing nulls
+            result_code, data = win32file.ReadFile(handle, 4096)
+            if result_code == 0:
                 response_str = data.decode('utf-8').strip('\x00')
-
-                # 3. Parse the response string into a dictionary
                 info_dict = {}
                 parts = response_str.strip(';').split(';')
                 for part in parts:
@@ -166,20 +149,15 @@ class ProcessInputController:
             else:
                 print(f"[{time.strftime('%H:%M:%S')}] ReadFile failed for PID {pid} with code {result_code}.")
                 return None
-
         except pywintypes.error as e:
             print(f"[{time.strftime('%H:%M:%S')}] Error reading response from PID {pid}: {e}")
-            # The pipe might be broken, mark for removal
             self.close_single_pipe(pid)
             return None
         except Exception as e:
             print(f"[{time.strftime('%H:%M:%S')}] Unexpected error reading response from PID {pid}: {e}")
             return None
 
-    # *** END: NEW BIDIRECTIONAL METHOD ***
-
     def broadcast_command(self, command_string: str):
-        # ... (This method remains largely the same) ...
         if not self.pipe_handles:
             print(f"[{time.strftime('%H:%M:%S')}] No processes currently connected to broadcast command.")
             return
@@ -191,7 +169,7 @@ class ProcessInputController:
                 print(f"[{time.strftime('%H:%M:%S')}] Failed to send command to PID {pid}. Marking for removal.")
                 pids_to_remove.append(pid)
         for pid in pids_to_remove:
-            self.close_single_pipe(pid)  # Use helper to close and remove
+            self.close_single_pipe(pid)
         print(f"[{time.strftime('%H:%M:%S')}] Broadcast complete. {len(self.pipe_handles)} processes remain connected.")
 
     def send_text(self, text: str):
@@ -199,6 +177,21 @@ class ProcessInputController:
             print(f"[{time.strftime('%H:%M:%S')}] Error: Input to send_text must be a string.")
             return
         command = f"{COMMAND_TYPE_PREFIX}{text}"
+        self.broadcast_command(command)
+
+    # *** 新增方法: 发送菜单命令 ***
+    def send_menu_command(self, command_id: int):
+        """
+        Sends a menu command ID to all connected processes.
+
+        Args:
+            command_id: The integer ID of the menu item to trigger.
+        """
+        if not isinstance(command_id, int):
+            print(f"[{time.strftime('%H:%M:%S')}] Error: command_id must be an integer.")
+            return
+        # 构建命令字符串, 例如: "MENU:40021"
+        command = f"{COMMAND_MENU_PREFIX}{command_id}"
         self.broadcast_command(command)
 
     def broadcast_single_message(self, message_to_send):
@@ -212,13 +205,12 @@ class ProcessInputController:
         return True
 
     def close_single_pipe(self, pid: int):
-        """Helper to close and remove a single pipe handle."""
         if pid in self.pipe_handles:
             handle = self.pipe_handles[pid]
             try:
                 win32file.CloseHandle(handle)
             except Exception:
-                pass  # Ignore errors on close
+                pass
             finally:
                 del self.pipe_handles[pid]
                 print(f"[{time.strftime('%H:%M:%S')}] Removed disconnected PID {pid}.")
@@ -236,39 +228,46 @@ class ProcessInputController:
 
 
 # --- MODIFIED Main Execution Block ---
-def executeMCP(message):
-    BROADCAST_MESSAGE = f"{message}"
+def executeMCP():
+    # *** 你的 "金手指代码" ***
+    TEXWORKS_FONT_MENU_ID = 302
+
     controller = None
     try:
         print("\n--- 初始化进程输入控制器 ---")
-        controller = ProcessInputController(dll_name=INJECTED_DLL_NAME, connect_timeout_ms=5000)
+        controller = ProcessInputController(dll_name=INJECTED_DLL_NAME)
 
         connected_pids = controller.get_connected_pids()
         if not connected_pids:
             print("\n--- 没有进程连接 ---")
-            print(f"无法连接到任何加载了 '{INJECTED_DLL_NAME}' DLL 的进程。")
+            print(
+                f"无法连接到任何加载了 '{INJECTED_DLL_NAME}' DLL 的进程。请确保目标程序(如 TeXworks)已运行且 DLL 已注入。")
             sys.exit(1)
 
         print(f"\n--- 成功连接到 {len(connected_pids)} 个进程, PID: {connected_pids} ---")
 
-        # --- 1. 演示单向广播 (原有功能) ---
-        print("\n--- 演示: 1. 单向广播消息 ---")
-        print(f"将要广播的消息: '{BROADCAST_MESSAGE}'")
-        controller.broadcast_single_message(BROADCAST_MESSAGE)
-        time.sleep(1)  # 等待一下，让窗口有时间处理输入
-
-        # --- 2. 演示双向通信 (新功能) ---
-        print("\n--- 演示: 2. 双向查询进程信息 ---")
+        # --- 1. 演示查询 (已有功能) ---
+        print("\n--- 演示: 1. 双向查询进程信息 ---")
         for pid in connected_pids:
-            # 调用新的查询方法
             info = controller.query_process_info(pid)
-            if info:
-                print(f"\n[PID: {pid}] 收到响应:")
-                print(f"  - 进程ID (来自DLL): {info.get('PID', 'N/A')}")
-                print(f"  - 窗口句柄 (HWND): {info.get('HWND', 'N/A')}")
-                print(f"  - 窗口标题: {info.get('Title', 'N/A')}")
+            if info and "TeXworks" in info.get('Title', ''):
+                print(f"[PID: {pid}] 确认目标为 TeXworks, 标题: {info.get('Title', 'N/A')}")
+            elif info:
+                print(f"[PID: {pid}] 收到响应: {info}")
             else:
                 print(f"\n[PID: {pid}] 未能获取响应信息。")
+
+        time.sleep(1)
+
+        # --- 2. 演示发送菜单命令 (新功能) ---
+        print("\n--- 演示: 2. 发送菜单命令以打开字体对话框 ---")
+        print(f"将要发送的菜单ID: {TEXWORKS_FONT_MENU_ID}")
+
+        # 调用新函数!
+        controller.send_menu_command(TEXWORKS_FONT_MENU_ID)
+
+        print("\n命令已发送。请检查 TeXworks 窗口是否弹出了字体设置对话框。")
+
 
     except KeyboardInterrupt:
         print("\n检测到键盘中断，正在退出...")
@@ -284,6 +283,4 @@ def executeMCP(message):
 
 
 if __name__ == "__main__":
-    # 你可以修改这里的消息来进行测试
-    executeMCP("8848")
-
+    executeMCP()
